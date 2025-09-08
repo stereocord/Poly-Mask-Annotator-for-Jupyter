@@ -4,6 +4,8 @@
 > A copy‑and‑paste friendly, offline‑first polygon mask annotator that runs **entirely in Jupyter** (ipywidgets + ipycanvas).  
 > Built for **casual segmentation tasks** and for **secure environments** (e.g., university clusters) where **data must not leave** the machine.
 
+![Sample_GIF](Animation.gif)
+
 **Current version:** v1.7.9
 
 - 🖱️ Draw & Edit polygons: add/move/delete/insert vertex
