@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-poly_mask_annotator.py  (v1.7.9, 2025-09-08)
+poly_mask_annotator.py  (v1.8.2, 2025-09-09)
 
-v1.7.5 の機能を維持しつつ、以下を正式サポートしました:
-- viewport_height: ビューポートの高さを固定（スクロール可）
-- min_zoom_pct / max_zoom_pct: ズーム範囲を指定（スライダと連動）
-- pan_via_scroll: Pan ON中、左ドラッグでスクロール（再描画なしのパン）
+v1.7.9 → v1.8.2 の主な追加/変更:
+- 「Type: Area / Polyline」トグルを正式追加（描画前に選択）。Polyline は Finish しても閉じません。
+- JSONに open_path を保存/復元。Editのヒット判定やInsertも open/closed で分岐。
+- Export：open は 1px の折れ線として index/カラーPNG 出力。
+- **UI改良**：Type の直後で改行し、
+  2 行目に「＋New / ✓Finish / ✗Cancel / ⌫Last point / Color / パレット」を配置して横幅を抑制。
+
+依存: Jupyter, ipywidgets, ipycanvas, scikit-image
 """
-
 from __future__ import annotations
 
 import json
@@ -34,7 +37,7 @@ except Exception as e:  # pragma: no cover
     ) from e
 
 try:
-    from skimage.draw import polygon as sk_polygon
+    from skimage.draw import polygon as sk_polygon, line as sk_line
 except Exception as e:  # pragma: no cover
     raise ImportError("This module requires scikit-image.\nInstall: pip install scikit-image") from e
 
@@ -58,6 +61,18 @@ def _euclid(a: Tuple[float, float], b: Tuple[float, float]) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
+def _dist_point_to_segment(px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> float:
+    """距離（点-線分）。"""
+    vx, vy = x2 - x1, y2 - y1
+    wx, wy = px - x1, py - y1
+    denom = vx * vx + vy * vy
+    if denom <= 1e-12:
+        return math.hypot(px - x1, py - y1)
+    t = max(0.0, min(1.0, (wx * vx + wy * wy) / denom))
+    qx, qy = x1 + t * vx, y1 + t * vy
+    return math.hypot(px - qx, py - qy)
+
+
 def chaikin(points: List[Tuple[float, float]], iterations: int = 2, closed: bool = True) -> List[Tuple[float, float]]:
     if len(points) < 3:
         return points[:]
@@ -79,27 +94,33 @@ def chaikin(points: List[Tuple[float, float]], iterations: int = 2, closed: bool
     return pts
 
 
-def chaikin_mixed(points: List[Tuple[float, float]], sharp_vertices: set[int], iterations: int = 2) -> List[Tuple[float, float]]:
+def chaikin_mixed(points: List[Tuple[float, float]], sharp_vertices: set[int], iterations: int = 2, closed: bool = True) -> List[Tuple[float, float]]:
     if not points:
         return []
     if len(points) < 3 or not sharp_vertices:
-        return chaikin(points, iterations=iterations, closed=True)
+        return chaikin(points, iterations=iterations, closed=closed)
     expanded: List[Tuple[float, float]] = []
     for i, p in enumerate(points):
         if i in sharp_vertices:
+            # 鋭角頂点は重複させて角を残す（open/closed 共通）
             expanded.extend([p, p, p])
         else:
             expanded.append(p)
-    return chaikin(expanded, iterations=iterations, closed=True)
+    return chaikin(expanded, iterations=iterations, closed=closed)
 
 
-def build_draw_points(points: List[Tuple[float, float]], smooth: bool, sharp_vertices: List[int]) -> List[Tuple[float, float]]:
+def build_draw_points(
+    points: List[Tuple[float, float]],
+    smooth: bool,
+    sharp_vertices: List[int],
+    closed: bool = True
+) -> List[Tuple[float, float]]:
     if not smooth:
         return points
     s = set(int(i) for i in (sharp_vertices or []))
     if s:
-        return chaikin_mixed(points, s, iterations=2)
-    return chaikin(points, iterations=2, closed=True)
+        return chaikin_mixed(points, s, iterations=2, closed=closed)
+    return chaikin(points, iterations=2, closed=closed)
 
 
 # ------------------------------------------------------------
@@ -114,6 +135,7 @@ class Region:
     points: List[Tuple[float, float]] = field(default_factory=list)  # (x, y) in full image
     smooth: bool = False
     sharp_vertices: List[int] = field(default_factory=list)
+    open_path: bool = False  # Trueなら開いた折れ線（領域ではない）
 
     def to_dict(self) -> Dict:
         return {
@@ -123,6 +145,7 @@ class Region:
             "smooth": self.smooth,
             "points": [[float(x), float(y)] for (x, y) in self.points],
             "sharp_vertices": [int(i) for i in (self.sharp_vertices or [])],
+            "open_path": bool(self.open_path),
         }
 
     @staticmethod
@@ -135,6 +158,7 @@ class Region:
             points=pts,
             smooth=bool(d.get("smooth", False)),
             sharp_vertices=[int(i) for i in d.get("sharp_vertices", [])],
+            open_path=bool(d.get("open_path", False)),
         )
 
 
@@ -180,12 +204,12 @@ class MaskAnnotator(VBox):
         # Viewport options
         show_scrollbars: bool = True,
         viewport_max_height: str = "80vh",
-        viewport_height: Optional[str] = None,      # ★ 追加: 固定高さ（スクロール）
+        viewport_height: Optional[str] = None,
         # Zoom range
-        min_zoom_pct: int = 10,                     # ★ 追加: ズーム下限
-        max_zoom_pct: int = 400,                    # ★ 追加: ズーム上限
+        min_zoom_pct: int = 10,
+        max_zoom_pct: int = 400,
         # Pan via scroll
-        pan_via_scroll: bool = False,               # ★ 追加: Pan ON中に左ドラッグでスクロール
+        pan_via_scroll: bool = False,
     ) -> None:
         super().__init__()
 
@@ -218,8 +242,8 @@ class MaskAnnotator(VBox):
         self._img_size_full: Tuple[int, int] = (0, 0)     # (H, W)
         self._scale: float = 1.0
         self._zoom_pct: int = 100
-        self._min_zoom: int = int(min_zoom_pct)           # ★ 反映
-        self._max_zoom: int = int(max_zoom_pct)           # ★ 反映
+        self._min_zoom: int = int(min_zoom_pct)
+        self._max_zoom: int = int(max_zoom_pct)
 
         # Pan
         self._pan_x: float = 0.0
@@ -234,6 +258,7 @@ class MaskAnnotator(VBox):
         self._current_label_id: int = 1
         self._current_color: str = _distinct_color(0)
         self._current_smooth: bool = False
+        self._current_open: bool = False  # 描画中の種別
         self._mode: str = "idle"  # idle | draw | edit
         self._selected_region_idx: Optional[int] = None
         self._selected_vertex_idx: Optional[int] = None
@@ -293,6 +318,14 @@ class MaskAnnotator(VBox):
         self.id_label = BoundedIntText(value=1, min=1, max=255, description="ID", layout=Layout(width="140px"))
         self.cp_color = ColorPicker(value=_distinct_color(0), description="Color")
         self.tb_smooth = ToggleButton(value=False, description="Smooth", tooltip="Chaikin smoothing")
+        # Type: Area / Polyline
+        self.tb_path_type = ToggleButtons(
+            options=[("Area", "closed"), ("Polyline", "open")],
+            value="closed",
+            description="Type",
+            tooltips=["塗りつぶし領域（閉）", "折れ線（開）"],
+        )
+
         self.btn_new = Button(description="＋ New region", button_style="info")
         self.btn_finish = Button(description="✓ Finish", button_style="success")
         self.btn_cancel = Button(description="✗ Cancel", button_style="warning")
@@ -335,6 +368,7 @@ class MaskAnnotator(VBox):
         self.btn_export = Button(description="Export PNG mask", button_style="primary")
 
         self.palette_new = HBox(self._make_palette_buttons(self._palette5, context="new"), layout=Layout(gap="4px"))
+
         self.palette_edit = HBox(self._make_palette_buttons(self._palette5, context="edit"), layout=Layout(gap="4px"))
 
         self.txt_filter = Text(value=self.file_filter, description="Filter", placeholder="e.g. *.png, *_BM.jpg", layout=Layout(width="280px"))
@@ -344,11 +378,18 @@ class MaskAnnotator(VBox):
         self.status_bar = HTML(value="Ready")
         self.help_box = HTML(
             value=(
-                "<details><summary><b>How to use (v1.7.9)</b></summary>"
+                "<details><summary><b>How to use (v1.8.2)</b></summary>"
                 "<div style='line-height:1.5; margin-top:0.5em'>"
                 "<h4>Pan &amp; Zoom</h4>"
                 f"<p>Zoom range: <b>{self._min_zoom}–{self._max_zoom}%</b>. Use slider / Fit / 100% / mouse wheel.</p>"
                 "<p>Pan: toggle <b>Pan</b>. If <i>pan_via_scroll=True</i>, left-drag in the viewport scrolls without redraw.</p>"
+                "<h4>Area vs Polyline</h4>"
+                "<ul>"
+                "<li><b>Area</b>: 従来通りの閉領域。Finish後は塗りと境界線が描かれ、Exportでは塗りを出力。</li>"
+                "<li><b>Polyline</b>: 開いた折れ線。Finish後もクローズしません。Exportでは1pxの線を出力します。</li>"
+                "</ul>"
+                "<h4>Toolbar layout</h4>"
+                "<p>Type の直後で改行し、2行目に New/Finish/Cancel/Last/Color をまとめています。</p>"
                 "</div>"
                 "</details>"
             )
@@ -356,22 +397,30 @@ class MaskAnnotator(VBox):
 
         row1 = HBox([self.dd_image, self.btn_prev, self.btn_next, self.btn_undo, self.btn_redo], layout=Layout(gap="8px", align_items="center", flex_flow="row wrap", width="100%"))
 
-        row2 = HBox([
-            self.txt_label, self.id_label, self.cp_color, self.tb_smooth,
-            self.btn_new, self.btn_finish, self.btn_cancel, self.btn_pop_last,
-            self.palette_new,
-        ], layout=Layout(gap="8px", align_items="center", flex_flow="row wrap"))
+        # ---- Toolbar rows (改行レイアウト) ----
+        # 1行目: Label, ID, Smooth, Type（ここで改行）
+        row2a = HBox([
+            self.txt_label, self.id_label, self.tb_smooth, self.tb_path_type
+        ], layout=Layout(gap="8px", align_items="center", flex_flow="row wrap", width="100%"))
+
+        # 2行目: New, Finish, Cancel, Last point, Color, パレット
+        row2b = HBox([
+            self.btn_new, self.btn_finish, self.btn_cancel, self.btn_pop_last, self.cp_color, self.palette_new
+        ], layout=Layout(gap="8px", align_items="center", flex_flow="row wrap", width="100%"))
+
+        # まとめて VBox に
+        row2 = VBox([row2a, row2b], layout=Layout(gap="6px", width="100%"))
 
         row3 = HBox([
             self.dd_regions, self.btn_edit, self.btn_del_point, self.btn_del_region,
             self.cp_edit_color, self.palette_edit, self.tb_vertex_state, self.btn_insert_point,
             self.txt_edit_label, self.btn_apply_label,
-        ], layout=Layout(gap="8px", align_items="center", flex_flow="row wrap"))
+        ], layout=Layout(gap="8px", align_items="center", flex_flow="row wrap", width="100%"))
 
         row4_elems = [self.btn_save, self.btn_load, self.btn_export]
         if self.allow_color_preview_export:
             row4_elems = [self.chk_export_index, self.chk_color_preview, self.chk_white_bg] + row4_elems
-        row4 = HBox(row4_elems, layout=Layout(gap="8px", align_items="center", flex_flow="row wrap"))
+        row4 = HBox(row4_elems, layout=Layout(gap="8px", align_items="center", flex_flow="row wrap", width="100%"))
 
         row1.children = tuple(list(row1.children) + [
             self.txt_filter, self.chk_recursive, self.btn_apply_filter,
@@ -638,29 +687,40 @@ class MaskAnnotator(VBox):
             return
         for ridx, r in enumerate(self.project.regions):
             pts = r.points
-            if len(pts) < 3:
+            min_pts = 2 if r.open_path else 3
+            if len(pts) < min_pts:
                 continue
-            draw_pts = build_draw_points(pts, r.smooth, getattr(r, "sharp_vertices", []))
+            draw_pts = build_draw_points(pts, r.smooth, getattr(r, "sharp_vertices", []), closed=(not r.open_path))
             draw_pts_view = [self._full_to_view(x, y) for (x, y) in draw_pts]
-            c.global_alpha = 0.35
-            c.fill_style = r.color
-            c.begin_path()
-            x0, y0 = draw_pts_view[0]
-            c.move_to(x0, y0)
-            for (x, y) in draw_pts_view[1:]:
-                c.line_to(x, y)
-            c.close_path()
-            c.fill()
+
             c.global_alpha = 1.0
             c.stroke_style = r.color
             c.line_width = 2
+
+            # 塗り（閉領域のみ）
+            if not r.open_path:
+                c.global_alpha = 0.35
+                c.fill_style = r.color
+                c.begin_path()
+                x0, y0 = draw_pts_view[0]
+                c.move_to(x0, y0)
+                for (x, y) in draw_pts_view[1:]:
+                    c.line_to(x, y)
+                c.close_path()
+                c.fill()
+                c.global_alpha = 1.0
+
+            # 境界線（open/closed 共通。open はクローズしない）
             c.begin_path()
             x0, y0 = draw_pts_view[0]
             c.move_to(x0, y0)
             for (x, y) in draw_pts_view[1:]:
                 c.line_to(x, y)
-            c.close_path()
+            if not r.open_path:
+                c.close_path()
             c.stroke()
+
+            # 頂点ハンドル（Edit中で選択中）
             if self._mode == "edit" and self._selected_region_idx == ridx:
                 for vidx, (px, py) in enumerate([self._full_to_view(px, py) for (px, py) in r.points]):
                     self._draw_handle(c, px, py, selected=(vidx == self._selected_vertex_idx))
@@ -669,6 +729,7 @@ class MaskAnnotator(VBox):
         c = self.canvas[2]
         c.clear()
         if self._mode == "draw" and len(self._current_points) > 0:
+            # プレビューは常に開いた形状で表示（閉でも描画途中でクローズしない）
             draw_pts = chaikin(self._current_points, iterations=2, closed=False) if self._current_smooth else self._current_points
             view_pts = [self._full_to_view(x, y) for (x, y) in draw_pts]
             c.stroke_style = self._current_color
@@ -736,20 +797,28 @@ class MaskAnnotator(VBox):
         self._current_label_id = int(self.id_label.value)
         self._current_color = self.cp_color.value
         self._current_smooth = bool(self.tb_smooth.value)
+        self._current_open = (self.tb_path_type.value == "open")
         self._current_points = []
         self._mode = "draw"
         self._selected_region_idx = None
         self._selected_vertex_idx = None
         self._redraw_current()
-        self._set_status("Drawing started: click to add points. Right-click/⌫ to remove last. Click near first point or press Finish to close.")
+        if self._current_open:
+            self._set_status("Drawing Polyline: click to add points. Right-click/⌫ to remove last. Press Finish to keep OPEN.")
+        else:
+            self._set_status("Drawing Area: click to add points. Right-click/⌫ to remove last. Click near first point or press Finish to close.")
 
     def _on_finish_click(self, b=None): self._finish_region()
     def _on_cancel_click(self, b=None): self._cancel_region()
     def _on_pop_last_click(self, b=None): self._pop_last_point()
 
     def _finish_region(self) -> None:
-        if self._mode != "draw" or len(self._current_points) < 3:
-            self._set_status("Need at least 3 points to finish.")
+        if self._mode != "draw":
+            self._set_status("Not in drawing mode.")
+            return
+        min_pts = 2 if self._current_open else 3
+        if len(self._current_points) < min_pts:
+            self._set_status(f"Need at least {min_pts} points to finish.")
             return
         r = Region(
             label=self._current_label_text,
@@ -757,6 +826,7 @@ class MaskAnnotator(VBox):
             color=self._current_color,
             points=self._current_points[:],
             smooth=self._current_smooth,
+            open_path=bool(self._current_open),
         )
         if self.project is None:
             self._set_status("No active project")
@@ -768,7 +838,8 @@ class MaskAnnotator(VBox):
         self._pre_draw_snapshot_json = None
         self._sync_region_dropdown()
         self._redraw_all()
-        self._set_status(f"Region added: {r.label} (id={r.label_id})")
+        typ = "Polyline (open)" if r.open_path else "Area (closed)"
+        self._set_status(f"Region added: {r.label} (id={r.label_id}, {typ})")
 
     def _cancel_region(self) -> None:
         had_points = len(self._current_points) > 0
@@ -829,8 +900,9 @@ class MaskAnnotator(VBox):
             self._set_status("No point selected")
             return
         r = self.project.regions[ridx]
-        if len(r.points) <= 3:
-            self._set_status("Polygon needs at least 3 points")
+        min_pts = 2 if r.open_path else 3
+        if len(r.points) <= min_pts:
+            self._set_status("Not enough points to keep the shape")
             return
         del r.points[vidx]
         if hasattr(r, "sharp_vertices") and r.sharp_vertices is not None:
@@ -932,9 +1004,17 @@ class MaskAnnotator(VBox):
 
         pts = r.points
         best_i, best_d, best_proj = 0, 1e18, (fx, fy)
-        for i in range(len(pts)):
+        n = len(pts)
+        edge_count = n if not r.open_path else (n - 1)
+        if edge_count <= 0:
+            r.points.append((float(fx), float(fy)))
+            self._push_undo_snapshot()
+            self._redraw_all()
+            return
+
+        for i in range(edge_count):
             x1, y1 = pts[i]
-            x2, y2 = pts[(i + 1) % len(pts)]
+            x2, y2 = pts[(i + 1) % n] if not r.open_path else pts[i + 1]
             vx, vy = (x2 - x1), (y2 - y1)
             wx, wy = (fx - x1), (fy - y1)
             denom = vx * vx + vy * vy + 1e-12
@@ -948,7 +1028,10 @@ class MaskAnnotator(VBox):
         self._selected_vertex_idx = insert_idx
         self._push_undo_snapshot()
         self._redraw_all()
-        self._set_status(f"Point inserted between {best_i} and {(best_i + 1) % len(pts)}")
+        if not r.open_path:
+            self._set_status(f"Point inserted between {best_i} and {(best_i + 1) % n}")
+        else:
+            self._set_status(f"Point inserted between {best_i} and {best_i + 1}")
 
     # --------------------------- Mouse handlers ---------------------------
     def _on_mouse_down(self, *args, **kwargs) -> None:
@@ -1054,7 +1137,8 @@ class MaskAnnotator(VBox):
     # --------------------------- Draw click ---------------------------
     def _handle_draw_click(self, vx: float, vy: float) -> None:
         fx, fy = self._view_to_full(vx, vy)
-        if len(self._current_points) >= 3:
+        # Area（閉）時のみ「最初の点をクリックでFinish」
+        if (not self._current_open) and len(self._current_points) >= 3:
             first_fx, first_fy = self._current_points[0]
             if _euclid((fx, fy), (first_fx, first_fy)) <= 8.0 / max(self._scale, 1e-6):
                 self._finish_region()
@@ -1262,26 +1346,40 @@ class MaskAnnotator(VBox):
         idx_mask = np.zeros((H, W), dtype=np.uint8)
         rgb_mask = np.full((H, W, 3), 255 if self.chk_white_bg.value else 0, dtype=np.uint8)
 
+        def _clip_rc(rr: np.ndarray, cc: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+            m = (rr >= 0) & (rr < H) & (cc >= 0) & (cc < W)
+            return rr[m], cc[m]
+
         for r in self.project.regions:
-            if len(r.points) < 3:
+            min_pts = 2 if r.open_path else 3
+            if len(r.points) < min_pts:
                 continue
-            pts = build_draw_points(r.points, r.smooth, getattr(r, "sharp_vertices", []))
-            xs = np.asarray([np.clip(x, 0, W - 1) for x, _ in pts], dtype=np.float32)
-            ys = np.asarray([np.clip(y, 0, H - 1) for _, y in pts], dtype=np.float32)
-            rr, cc = sk_polygon(ys, xs, shape=(H, W))
-            idx = int(np.clip(r.label_id, 0, 255))
-            idx_mask[rr, cc] = idx
-            # プレビュー用カラー塗り
-            def _hx(c: str) -> Tuple[int,int,int]:
-                s = c.lstrip("#")
-                if len(s)==3: s="".join(ch*2 for ch in s)
-                try:
-                    return (int(s[0:2],16), int(s[2:4],16), int(s[4:6],16))
-                except Exception: return (255,0,0)
-            cr, cg, cb = _hx(r.color)
-            rgb_mask[rr, cc, 0] = cr
-            rgb_mask[rr, cc, 1] = cg
-            rgb_mask[rr, cc, 2] = cb
+            pts = build_draw_points(r.points, r.smooth, getattr(r, "sharp_vertices", []), closed=(not r.open_path))
+
+            if not r.open_path:
+                # 塗りつぶし（従来）
+                xs = np.asarray([np.clip(x, 0, W - 1) for x, _ in pts], dtype=np.float32)
+                ys = np.asarray([np.clip(y, 0, H - 1) for _, y in pts], dtype=np.float32)
+                rr, cc = sk_polygon(ys, xs, shape=(H, W))
+                idx = int(np.clip(r.label_id, 0, 255))
+                idx_mask[rr, cc] = idx
+                cr, cg, cb = self._hex_to_rgb(r.color)
+                rgb_mask[rr, cc, 0] = cr
+                rgb_mask[rr, cc, 1] = cg
+                rgb_mask[rr, cc, 2] = cb
+            else:
+                # 1px の折れ線を描画
+                idx = int(np.clip(r.label_id, 0, 255))
+                cr, cg, cb = self._hex_to_rgb(r.color)
+                for i in range(len(pts) - 1):
+                    x1, y1 = pts[i]
+                    x2, y2 = pts[i + 1]
+                    rr, cc = sk_line(int(round(y1)), int(round(x1)), int(round(y2)), int(round(x2)))
+                    rr, cc = _clip_rc(rr, cc)
+                    idx_mask[rr, cc] = idx
+                    rgb_mask[rr, cc, 0] = cr
+                    rgb_mask[rr, cc, 1] = cg
+                    rgb_mask[rr, cc, 2] = cb
 
         saved_names = []
         out_idx = img_path.with_suffix("").with_name(img_path.stem + "_mask.png")
@@ -1322,7 +1420,10 @@ class MaskAnnotator(VBox):
                 pass
             return
 
-        opts = [(f"#{i}: {r.label} (id={r.label_id})", i) for i, r in enumerate(self.project.regions)]
+        opts = []
+        for i, r in enumerate(self.project.regions):
+            open_tag = ", open" if r.open_path else ""
+            opts.append((f"#{i}: {r.label} (id={r.label_id}{open_tag})", i))
         self.dd_regions.options = opts
 
         if self._selected_region_idx is None or self._selected_region_idx >= len(opts):
@@ -1338,21 +1439,39 @@ class MaskAnnotator(VBox):
             pass
 
     def _hit_region(self, fx: float, fy: float) -> Optional[int]:
+        """クリックによるリージョン選択。
+        - closed: 点内判定（従来）
+        - open  : 線分への距離しきい値で判定
+        """
         if not self.project:
             return None
+        tol = 6.0 / max(self._scale, 1e-6)  # 画面上およそ 6px
         for i, r in enumerate(self.project.regions):
             pts = r.points
-            if len(pts) < 3:
+            if len(pts) < (2 if r.open_path else 3):
                 continue
-            inside = False
-            n = len(pts)
-            for j in range(n):
-                x1, y1 = pts[j]
-                x2, y2 = pts[(j + 1) % n]
-                if ((y1 > fy) != (y2 > fy)) and (fx < (x2 - x1) * (fy - y1) / (y2 - y1 + 1e-12) + x1):
-                    inside = not inside
-            if inside:
-                return i
+            if not r.open_path:
+                # 内外判定（奇偶規則）
+                inside = False
+                n = len(pts)
+                for j in range(n):
+                    x1, y1 = pts[j]
+                    x2, y2 = pts[(j + 1) % n]
+                    if ((y1 > fy) != (y2 > fy)) and (fx < (x2 - x1) * (fy - y1) / (y2 - y1 + 1e-12) + x1):
+                        inside = not inside
+                if inside:
+                    return i
+            else:
+                # 線分への最近距離
+                near = False
+                for j in range(len(pts) - 1):
+                    x1, y1 = pts[j]
+                    x2, y2 = pts[j + 1]
+                    if _dist_point_to_segment(fx, fy, x1, y1, x2, y2) <= tol:
+                        near = True
+                        break
+                if near:
+                    return i
         return None
 
     # --------------------------- Status ---------------------------

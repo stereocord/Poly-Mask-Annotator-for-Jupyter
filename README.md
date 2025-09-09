@@ -6,7 +6,7 @@
 
 ![Sample_GIF](Animation.gif)
 
-**Current version:** v1.7.9
+**Current version:** v1.8.2
 
 - 🖱️ Draw & Edit polygons: add/move/delete/insert vertex
 - ✨ Chaikin smoothing with per‑vertex **Smooth/Sharp** preservation
@@ -15,6 +15,17 @@
 - 💾 Sidecar **JSON** per image (auto save/load)
 - 🖼️ Export: **uint8 index mask** + **RGB color preview**
 - 🧰 Scrollable viewport that prevents aspect‑ratio distortion from parent layout
+
+## New in v1.8.2
+
+- **Polyline (open path) support**  
+  - Toggle **Type: Area / Polyline** before drawing.  
+  - **Area** (closed polygon): behaves as before — fill + stroke, exported as filled mask.  
+  - **Polyline** (open path): Finish leaves the region open — drawn as a stroked line only, exported as a 1-px wide line mask.  
+  - JSON sidecars now preserve `open_path`.  
+  - Edit mode: open paths are selected by clicking near a line segment (~6 px tolerance).  
+  - Insert/Delete point logic handles open vs. closed correctly.  
+- **Toolbar layout update**  
 
 ---
 
