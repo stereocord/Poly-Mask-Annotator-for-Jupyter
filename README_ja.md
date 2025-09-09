@@ -121,7 +121,7 @@ from poly_mask_annotator import MaskAnnotator
 ui = MaskAnnotator(
     folder=\"/path/to/images\",   # ← ここを変更
     enable_wheel_zoom=True,
-    viewport_height=\"70vh\",     # 未指定なら viewport_max_height=\"80vh\"（上限）
+    viewport_height=\"600px\",     # 未指定なら viewport_max_height=\"80vh\"（上限）
     min_zoom_pct=10, max_zoom_pct=400,
     pan_via_scroll=True,          # Pan ON 中はビューポート左ドラッグでスクロール（再描画なし）
 )
@@ -189,7 +189,7 @@ MaskAnnotator(
     file_filter: str = "",
     recursive: bool = False,
     show_scrollbars: bool = True,
-    viewport_max_height: str = "80vh",
+    viewport_max_height: str = "600px",
     viewport_height: str | None = None,  # 例: "70vh" or "600px"
     min_zoom_pct: int = 10,
     max_zoom_pct: int = 400,
